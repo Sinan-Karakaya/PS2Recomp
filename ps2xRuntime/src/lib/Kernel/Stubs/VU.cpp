@@ -297,6 +297,18 @@ namespace ps2_stubs
             float out[16]{};
             rigidInverse(m, out);
 
+            // PS2_VU_TRACE_CAMERA logs the inputs and caller of each camera
+            // build; a scene that draws nothing usually shows a bad eye/forward here.
+            static const bool trace = std::getenv("PS2_VU_TRACE_CAMERA") != nullptr;
+            if (trace)
+            {
+                static uint64_t calls = 0;
+                if (++calls <= 64 || (calls % 600) == 0)
+                    std::fprintf(stderr, "[vu-camera] #%llu ra=%08x eye=(%g,%g,%g,%g) fwd=(%g,%g,%g,%g) up=(%g,%g,%g,%g)\n",
+                                 static_cast<unsigned long long>(calls), getRegU32(ctx, 31),
+                                 eye[0], eye[1], eye[2], eye[3], fwd[0], fwd[1], fwd[2], fwd[3], up[0], up[1], up[2], up[3]);
+            }
+
             (void)writeVuMatrix4f(rdram, dstAddr, out);
         }
         setReturnS32(ctx, 0);

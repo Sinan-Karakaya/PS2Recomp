@@ -8,6 +8,8 @@
 #include "ps2_vu1_capture.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <bit>
 #include <cfenv>
 #include <cmath>
@@ -184,8 +186,34 @@ void VU1Interpreter::finishXgkick()
     m_xgkick.active = false;
 }
 
+
+namespace
+{
+    // DQ8_TRACE_VU1_RATE prints VU1 program starts and XGKICKs per second, to
+    // tell a scene whose models never reach VU1 from one VU1 culls entirely.
+    struct Vu1RateTrace
+    {
+        std::atomic<uint64_t> starts{0}, kicks{0};
+        std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+        bool enabled = std::getenv("DQ8_TRACE_VU1_RATE") != nullptr;
+        void tick()
+        {
+            const auto now = std::chrono::steady_clock::now();
+            const double seconds = std::chrono::duration<double>(now - last).count();
+            if (seconds < 2.0)
+                return;
+            last = now;
+            std::fprintf(stderr, "[vu1-rate] %.0f starts/s %.0f kicks/s\n",
+                         starts.exchange(0) / seconds, kicks.exchange(0) / seconds);
+        }
+    };
+    Vu1RateTrace g_vu1Rate;
+}
+
 void VU1Interpreter::startXgkick(uint32_t qwordAddress)
 {
+    if (g_vu1Rate.enabled && m_unit == Unit::VU1)
+        ++g_vu1Rate.kicks;
     if (m_unit != Unit::VU1 || !m_activeVuData || m_activeVuDataSize < 16u)
         return;
 
@@ -281,6 +309,11 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
                              uint32_t startPC, uint32_t top, uint32_t itop,
                              uint32_t maxCycles)
 {
+    if (g_vu1Rate.enabled && m_unit == Unit::VU1)
+    {
+        ++g_vu1Rate.starts;
+        g_vu1Rate.tick();
+    }
     resetScheduler();
     m_state.pc = startPC & microAddressMask();
     m_state.ebit = false;

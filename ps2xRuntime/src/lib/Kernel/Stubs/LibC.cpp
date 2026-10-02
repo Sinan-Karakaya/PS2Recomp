@@ -23,6 +23,54 @@ namespace ps2_stubs
         }
     }
 
+
+    namespace
+    {
+        // DQ8_WATCH="addr:len,addr:len" (hex): log any string/memory stub that
+        // changes a watched guest range, with its caller and the new bytes.
+        struct WatchRange { uint32_t addr, len; };
+        const std::vector<WatchRange> &watchRanges()
+        {
+            static const std::vector<WatchRange> ranges = [] {
+                std::vector<WatchRange> out;
+                const char *env = std::getenv("DQ8_WATCH");
+                while (env && *env)
+                {
+                    char *end = nullptr;
+                    const uint32_t addr = static_cast<uint32_t>(std::strtoul(env, &end, 16));
+                    uint32_t len = 16;
+                    if (end && *end == ':') len = static_cast<uint32_t>(std::strtoul(end + 1, &end, 16));
+                    out.push_back({addr & 0x1FFFFFFu, std::min<uint32_t>(len, 64)});
+                    env = (end && *end == ',') ? end + 1 : nullptr;
+                }
+                return out;
+            }();
+            return ranges;
+        }
+        struct WatchScope
+        {
+            uint8_t *rdram; R5900Context *ctx; const char *op; uint8_t before[8][64]{};
+            WatchScope(uint8_t *r, R5900Context *c, const char *o) : rdram(r), ctx(c), op(o)
+            {
+                const auto &w = watchRanges();
+                for (size_t i = 0; i < w.size() && i < 8; ++i) std::memcpy(before[i], rdram + w[i].addr, w[i].len);
+            }
+            ~WatchScope()
+            {
+                const auto &w = watchRanges();
+                for (size_t i = 0; i < w.size() && i < 8; ++i)
+                {
+                    if (std::memcmp(before[i], rdram + w[i].addr, w[i].len) == 0) continue;
+                    std::fprintf(stderr, "[watch] %s ra=%08x a0=%08x a1=%08x a2=%08x range=%08x:", op, getRegU32(ctx, 31),
+                                 getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6), w[i].addr);
+                    for (uint32_t b = 0; b < w[i].len; ++b) std::fprintf(stderr, " %02x", rdram[w[i].addr + b]);
+                    std::fprintf(stderr, " |");
+                    for (uint32_t b = 0; b < w[i].len; ++b) { const uint8_t c = rdram[w[i].addr + b]; std::fputc(c >= 32 && c < 127 ? c : '.', stderr); }
+                    std::fprintf(stderr, "|\n");
+                }
+            }
+        };
+    }
     namespace
     {
         uint32_t sanitizeMemTransferSize(uint32_t size, const char *op)
@@ -108,6 +156,7 @@ namespace ps2_stubs
 
     void memcpy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        WatchScope watchScope(rdram, ctx, "memcpy");
         uint32_t destAddr = getRegU32(ctx, 4); // $a0
         uint32_t srcAddr = getRegU32(ctx, 5);  // $a1
         uint32_t size = getRegU32(ctx, 6);     // $a2
@@ -150,6 +199,7 @@ namespace ps2_stubs
 
     void memset(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        WatchScope watchScope(rdram, ctx, "memset");
         uint32_t destAddr = getRegU32(ctx, 4);       // $a0
         int value = (int)(getRegU32(ctx, 5) & 0xFF); // $a1 (char value)
         uint32_t size = getRegU32(ctx, 6);           // $a2
@@ -188,6 +238,7 @@ namespace ps2_stubs
 
     void memclr(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        WatchScope watchScope(rdram, ctx, "memclr");
         uint32_t destAddr = getRegU32(ctx, 4); // $a0
         uint32_t size = getRegU32(ctx, 5);     // $a1
         size = sanitizeMemTransferSize(size, "memclr");
@@ -224,6 +275,7 @@ namespace ps2_stubs
 
     void memmove(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        WatchScope watchScope(rdram, ctx, "memmove");
         uint32_t destAddr = getRegU32(ctx, 4); // $a0
         uint32_t srcAddr = getRegU32(ctx, 5);  // $a1
         uint32_t size = getRegU32(ctx, 6);     // $a2
@@ -290,6 +342,7 @@ namespace ps2_stubs
 
     void strcpy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        WatchScope watchScope(rdram, ctx, "strcpy");
         uint32_t destAddr = getRegU32(ctx, 4); // $a0
         uint32_t srcAddr = getRegU32(ctx, 5);  // $a1
 
@@ -315,6 +368,7 @@ namespace ps2_stubs
 
     void strncpy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        WatchScope watchScope(rdram, ctx, "strncpy");
         uint32_t destAddr = getRegU32(ctx, 4); // $a0
         uint32_t srcAddr = getRegU32(ctx, 5);  // $a1
         uint32_t size = getRegU32(ctx, 6);     // $a2
@@ -411,6 +465,7 @@ namespace ps2_stubs
 
     void strcat(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        WatchScope watchScope(rdram, ctx, "strcat");
         uint32_t destAddr = getRegU32(ctx, 4); // $a0
         uint32_t srcAddr = getRegU32(ctx, 5);  // $a1
 
@@ -435,6 +490,7 @@ namespace ps2_stubs
 
     void strncat(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        WatchScope watchScope(rdram, ctx, "strncat");
         uint32_t destAddr = getRegU32(ctx, 4); // $a0
         uint32_t srcAddr = getRegU32(ctx, 5);  // $a1
         uint32_t size = getRegU32(ctx, 6);     // $a2
@@ -583,6 +639,7 @@ namespace ps2_stubs
 
     void sprintf(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        WatchScope watchScope(rdram, ctx, "sprintf");
         uint32_t str_addr = getRegU32(ctx, 4);     // $a0
         uint32_t format_addr = getRegU32(ctx, 5);  // $a1
         constexpr size_t kSafeSprintfBytes = 256u; // Keep guest stack temporaries from being overwritten.
@@ -1164,6 +1221,7 @@ namespace ps2_stubs
 
     void vsprintf(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        WatchScope watchScope(rdram, ctx, "vsprintf");
         uint32_t str_addr = getRegU32(ctx, 4);      // $a0
         uint32_t format_addr = getRegU32(ctx, 5);   // $a1
         uint32_t va_list_addr = getRegU32(ctx, 6);  // $a2
