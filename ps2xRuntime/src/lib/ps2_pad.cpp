@@ -230,7 +230,7 @@ namespace
         return it == kNames.end() ? 0u : it->second;
     }
 
-    void parsePadScript(const std::string &text)
+    void parsePadScript(const std::string &text, uint64_t base = 0u)
     {
         std::string entry;
         std::istringstream stream(text);
@@ -253,7 +253,7 @@ namespace
                     continue;
                 }
                 PadScriptEvent event{};
-                event.frame = frame;
+                event.frame = base + frame;
                 uint64_t hold = 0u;
                 if (fields >> hold && hold > 0u)
                 {
@@ -314,11 +314,63 @@ namespace
         (void)loaded;
     }
 
+    // DQ8_PAD_LIVE=path is a script fed while the game runs: lines appended to
+    // the file use the DQ8_PAD_SCRIPT format, with the frame counted from the
+    // guest frame at which the line is read, so a tool can drive the game a
+    // step at a time from screenshots.
+    void pollPadLive(uint64_t frame)
+    {
+        static const std::string path = [] {
+            const char *value = std::getenv("DQ8_PAD_LIVE");
+            return std::string(value != nullptr ? value : "");
+        }();
+        static std::streamoff consumed = 0;
+        static uint64_t lastPoll = 0u;
+        if (path.empty() || (frame < lastPoll + 4u && lastPoll != 0u))
+        {
+            return;
+        }
+        lastPoll = frame;
+        std::ifstream file(path, std::ios::binary);
+        if (!file)
+        {
+            return;
+        }
+        file.seekg(0, std::ios::end);
+        const std::streamoff size = file.tellg();
+        if (size < consumed)
+        {
+            consumed = 0;
+        }
+        if (size == consumed)
+        {
+            return;
+        }
+        file.seekg(consumed);
+        std::string text(static_cast<size_t>(size - consumed), '\0');
+        file.read(text.data(), static_cast<std::streamsize>(text.size()));
+        // Only whole lines; a writer may be midway through the last one.
+        const size_t end = text.rfind('\n');
+        if (end == std::string::npos)
+        {
+            return;
+        }
+        text.resize(end + 1u);
+        consumed += static_cast<std::streamoff>(text.size());
+        parsePadScript(text, frame);
+        if (g_padScriptVerbose)
+        {
+            std::fprintf(stderr, "[pad] frame %llu: live script read\n",
+                         static_cast<unsigned long long>(frame));
+        }
+    }
+
     // Merges scripted buttons into whatever the host sampled, so a human can
     // still take over while a script is running.
     void applyPadScript(uint32_t &held, uint32_t &pressed)
     {
         ensurePadScriptLoaded();
+        pollPadLive(g_guestFrame.load(std::memory_order_relaxed));
         if (g_padScript.empty())
         {
             return;
