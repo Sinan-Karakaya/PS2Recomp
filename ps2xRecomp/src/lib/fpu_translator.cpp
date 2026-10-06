@@ -53,10 +53,12 @@ namespace ps2recomp
             case COP1_S_MUL:
                 return fmt::format("ctx->f[{}] = FPU_MUL_S(ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
             case COP1_S_DIV:
+                // The R5900 has no infinities: x / 0 gives the largest float,
+                // signed by the XOR of the operands' signs.
                 return fmt::format("if (ctx->f[{}] == 0.0f) {{ ctx->fcr31 |= 0x100000; /* DZ flag */ "
-                                   "ctx->f[{}] = copysignf(INFINITY, ctx->f[{}] * 0.0f); }} "
+                                   "ctx->f[{}] = (std::signbit(ctx->f[{}]) != std::signbit(ctx->f[{}])) ? -3.4028234663852886e38f : 3.4028234663852886e38f; }} "
                                    "else ctx->f[{}] = ctx->f[{}] / ctx->f[{}];",
-                                   ft, fd, fs, fd, fs, ft);
+                                   ft, fd, fs, ft, fd, fs, ft);
             case COP1_S_SQRT:
                 // R5900 SQRT.S uses ft, unlike ABS.S/MOV.S/NEG.S.
                 return fmt::format("ctx->f[{}] = FPU_SQRT_S(ctx->f[{}]);", fd, ft);
