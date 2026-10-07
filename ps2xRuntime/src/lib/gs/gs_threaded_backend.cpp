@@ -105,9 +105,11 @@ struct GSThreadedBackend::Impl
         staged.push_back(std::move(command));
         stagedBytes += size;
         // Handed over in groups: per-command locking and wakeups cost more
-        // than the copies. An idle worker gets them at once.
+        // than the copies. An idle worker gets a group of 16, and takes a
+        // shorter tail itself within 2 ms.
         if (flush || staged.size() >= kStageCommands ||
-            stagedBytes >= std::min(kStageBytes, capacity) || idle.load(std::memory_order_acquire))
+            stagedBytes >= std::min(kStageBytes, capacity) ||
+            (staged.size() >= kIdleStageCommands && idle.load(std::memory_order_acquire)))
             publishStaged(flush);
     }
 
@@ -320,6 +322,7 @@ struct GSThreadedBackend::Impl
     std::atomic<bool> idle{false}; // the worker is waiting for commands
     std::atomic<bool> failed{false}; // set with `error`, read without `mutex`
     static constexpr size_t kStageCommands = 128u;
+    static constexpr size_t kIdleStageCommands = 16u;
     static constexpr size_t kStageBytes = 256u * 1024u;
     size_t outstandingBytes = 0u;
     bool urgent = false, stopping = false;
