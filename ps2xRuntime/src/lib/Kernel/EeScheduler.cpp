@@ -2281,7 +2281,13 @@ void EeScheduler::processPendingEvents()
         }
     }
     // INTC VIF0 (4) and VIF1 (5), raised by a VIFcode carrying the i bit.
-    const uint32_t vifInterrupts = m_runtime.memory().takePendingVifInterrupts();
+    // The EE takes no interrupt while it handles one, so VIF interrupts wait
+    // until the thread about to resume has no handler on its invocation stack.
+    bool handlerActive = m_insideInterrupt;
+    if (const GuestThread *thread = currentThread(); thread && !handlerActive)
+        for (const GuestInvocation &invocation : thread->invocations)
+            handlerActive = handlerActive || invocation.kind == GuestInvocationKind::Interrupt;
+    const uint32_t vifInterrupts = handlerActive ? 0u : m_runtime.memory().takePendingVifInterrupts();
     if ((vifInterrupts & 0x1u) != 0u)
     {
         dispatchIrq(false, 4u);
