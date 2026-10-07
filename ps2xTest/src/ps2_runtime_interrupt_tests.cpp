@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstring>
 #include <exception>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -65,6 +66,14 @@ namespace
     constexpr uint32_t kTimer2ResumePc = 0x00160510u;
     constexpr uint32_t kTimer2HandlerPc = 0x00160520u;
 
+    constexpr uint32_t kStackMainPc = 0x00160700u;
+    constexpr uint32_t kStackMainResumePc = 0x00160710u;
+    constexpr uint32_t kStackThreadPc = 0x00160720u;
+    constexpr uint32_t kStackThreadParkPc = 0x00160730u;
+    constexpr uint32_t kStackHandlerPc = 0x00160740u;
+    constexpr int kStackThreadCount = 96; // more than the 1 MiB pool holds (64 x 16 KiB)
+
+
     constexpr uint32_t kVifNestMainPc = 0x00160600u;
     constexpr uint32_t kVifNestResumePc = 0x00160610u;
     constexpr uint32_t kVifNestHandlerPc = 0x00160620u;
@@ -93,6 +102,10 @@ namespace
     int g_vifHandlerDepth = 0;
     int g_vifHandlerMaxDepth = 0;
     int g_vifHandlerRuns = 0;
+    int g_stackHandlerRuns = 0;
+    int g_stackThreadsParked = 0;
+    int g_stackDoneSema = 0;
+    int g_stackParkSema = 0;
 
     void setRegU32(R5900Context &ctx, int reg, uint32_t value)
     {
@@ -283,6 +296,55 @@ namespace
         ctx->pc = 0u;
         runtime->requestStop();
     }
+
+    // Each thread takes one interrupt and then stays alive, parked.
+    void schedulerStackMain(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        EeScheduler &scheduler = runtime->eeScheduler();
+        g_stackDoneSema = scheduler.createSemaphore(0, 1, 0u, 0u);
+        g_stackParkSema = scheduler.createSemaphore(0, 1, 0u, 0u);
+        scheduler.addIrqHandler(false, 5u, kStackHandlerPc, true, 0u, 0u, 0u);
+        scheduler.setIrqCauseEnabled(false, 5u, true);
+        for (int i = 0; i < kStackThreadCount; ++i)
+        {
+            EeThreadCreateParams params{};
+            params.entry = kStackThreadPc;
+            params.stack = 0x40000u + static_cast<uint32_t>(i) * 0x1000u;
+            params.stackSize = 0x1000u;
+            params.priority = 10;
+            scheduler.startThread(scheduler.createThread(params), 0u, *ctx, false);
+        }
+        ctx->pc = kStackMainResumePc;
+        scheduler.waitSemaphore(g_stackDoneSema);
+    }
+
+    void schedulerStackMainResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
+    void schedulerStackThread(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        runtime->eeScheduler().dispatchIrq(false, 5u);
+        ctx->pc = kStackThreadParkPc;
+    }
+
+    void schedulerStackThreadPark(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        EeScheduler &scheduler = runtime->eeScheduler();
+        if (++g_stackThreadsParked == kStackThreadCount)
+            scheduler.signalSemaphore(g_stackDoneSema, false);
+        ctx->pc = 0u;
+        scheduler.waitSemaphore(g_stackParkSema);
+    }
+
+    void schedulerStackHandler(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        ++g_stackHandlerRuns;
+        ctx->pc = 0u;
+    }
+
 
     // A VIF1 NOP with the i bit: raises the VIF1 interrupt.
     void raiseVif1Interrupt(PS2Runtime *runtime)
@@ -539,6 +601,33 @@ void register_ps2_runtime_interrupt_tests()
             t.Equals(g_lastIntcArg.load(std::memory_order_relaxed), 0xCAFEu,
                      "the IRQ frame should receive its registered argument");
         });
+
+        tc.Run("interrupts on many live threads do not run out of invocation stacks", [](TestCase &t)
+        {
+            TestEnv env;
+            env.runtime.registerFunction(kStackMainPc, schedulerStackMain);
+            env.runtime.registerFunction(kStackMainResumePc, schedulerStackMainResume);
+            env.runtime.registerFunction(kStackThreadPc, schedulerStackThread);
+            env.runtime.registerFunction(kStackThreadParkPc, schedulerStackThreadPark);
+            env.runtime.registerFunction(kStackHandlerPc, schedulerStackHandler);
+            g_stackHandlerRuns = g_stackThreadsParked = 0;
+            R5900Context mainContext{};
+            mainContext.pc = kStackMainPc;
+            env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+            std::string failure;
+            try
+            {
+                env.runtime.eeScheduler().run();
+            }
+            catch (const std::exception &error)
+            {
+                failure = error.what();
+            }
+
+            t.IsTrue(failure.empty(), "no thread should run out of invocation stacks: " + failure);
+            t.Equals(g_stackHandlerRuns, kStackThreadCount, "every thread's interrupt should be handled");
+        });
+
 
         tc.Run("VIF interrupt raised inside a running handler waits until it returns", [](TestCase &t)
         {

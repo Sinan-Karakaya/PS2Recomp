@@ -351,6 +351,7 @@ void EeScheduler::run()
             {
                 GuestInvocation completed = std::move(running->invocations.back());
                 running->invocations.pop_back();
+                releaseInvocationStack(running->id, running->invocations.size());
                 if (completed.onComplete)
                 {
                     try
@@ -1513,6 +1514,20 @@ uint32_t EeScheduler::invocationStackTop()
     }
     m_invocationStackTops.emplace(key, top);
     return top;
+}
+
+// A stack is only in use while its invocation runs: interrupts land on
+// whichever thread is current, so holding it until the thread exits drained
+// the pool on threads that took one interrupt and lived on.
+void EeScheduler::releaseInvocationStack(int threadId, size_t depth)
+{
+    const uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(threadId)) << 32u) |
+                         static_cast<uint32_t>(depth);
+    const auto held = m_invocationStackTops.find(key);
+    if (held == m_invocationStackTops.end())
+        return;
+    m_freeInvocationStacks.push_back(held->second);
+    m_invocationStackTops.erase(held);
 }
 
 // Stacks are keyed per (thread, depth) and the pool only bumps down, so without
