@@ -603,6 +603,56 @@ void register_ps2_memory_tests()
             t.Equals(v3x, 0xAAAAAAAAu, "second vector should write at addr CL (addr 3)");
         });
 
+        tc.Run("VIF unmasked UNPACK matches the masked path with an all-data mask", [](TestCase &t)
+        {
+            // Unmasked UNPACKs with MODE 0 and CL >= WL take a shorter path. A
+            // mask of all zeros selects the data for every lane, so the masked
+            // path must write exactly the same VU memory.
+            struct Format
+            {
+                uint8_t vn, vl;
+            };
+            const Format formats[] = {{0, 0}, {0, 1}, {0, 2}, {1, 0}, {1, 1}, {1, 2}, {2, 0},
+                                      {2, 1}, {2, 2}, {3, 0}, {3, 1}, {3, 2}, {3, 3}};
+            const uint16_t cycles[] = {static_cast<uint16_t>((4u << 8) | 4u), static_cast<uint16_t>((1u << 8) | 3u)};
+            constexpr uint8_t kVectors = 5u;
+            int mismatches = 0;
+            for (const Format &format : formats)
+                for (const uint16_t cycle : cycles)
+                    for (const uint16_t extension : {uint16_t(0u), uint16_t(0x4000u)})
+                    {
+                        const uint32_t bitsPerVector =
+                            format.vl == 3u ? 16u : (format.vn + 1u) * (32u >> format.vl);
+                        std::vector<uint8_t> payload((kVectors * bitsPerVector / 8u + 3u) & ~3u);
+                        for (size_t i = 0; i < payload.size(); ++i)
+                            payload[i] = static_cast<uint8_t>(0x80u + i * 37u);
+                        const uint8_t opcode = static_cast<uint8_t>(0x60u | (format.vn << 2) | format.vl);
+
+                        std::vector<uint8_t> written[2];
+                        for (int masked = 0; masked < 2; ++masked)
+                        {
+                            PS2Memory mem;
+                            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+                            std::memset(mem.getVU1Data(), 0xA5, PS2_VU1_DATA_SIZE);
+                            std::vector<uint8_t> packet;
+                            appendU32(packet, makeVifCmd(0x01u, 0u, cycle)); // STCYCL
+                            if (masked)
+                            {
+                                appendU32(packet, makeVifCmd(0x20u, 0u, 0u)); // STMASK
+                                appendU32(packet, 0u);                        // every lane: data
+                            }
+                            appendU32(packet, makeVifCmd(static_cast<uint8_t>(opcode | (masked ? 0x10u : 0u)),
+                                                         kVectors, extension));
+                            packet.insert(packet.end(), payload.begin(), payload.end());
+                            mem.processVIF1Data(packet.data(), static_cast<uint32_t>(packet.size()));
+                            written[masked].assign(mem.getVU1Data(), mem.getVU1Data() + 16u * 32u);
+                        }
+                        if (written[0] != written[1])
+                            ++mismatches;
+                    }
+            t.Equals(mismatches, 0, "every format, cycle and extension should write the same VU memory");
+        });
+
         tc.Run("VIF masked UNPACK uses data row col and protect selectors", [](TestCase &t)
         {
             PS2Memory mem;
