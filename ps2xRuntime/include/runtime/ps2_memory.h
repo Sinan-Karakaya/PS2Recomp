@@ -359,6 +359,8 @@ public:
     // calls mtvuSync() before it observes anything that work produces:
     // VIF1/GIF registers, VU1 memory, GS privileged registers, the GS.
     void setMtvuEnabled(bool enabled);
+    // Waits for each hand-off at once (PS2_MTVU=2), to check the plumbing.
+    void setMtvuLockstep(bool lockstep) { m_mtvuLockstep.store(lockstep, std::memory_order_release); }
     bool mtvuEnabled() const { return m_mtvuEnabled.load(std::memory_order_acquire); }
     // Waits for queued work. A no-op on the worker, or with nothing queued.
     void mtvuSync() const;
@@ -472,10 +474,12 @@ public:
     size_t m_mtvuQueuedBytes = 0;
     bool m_mtvuStop = false;
     std::exception_ptr m_mtvuError;
+    std::atomic<bool> m_mtvuFailed{false}; // set with m_mtvuError
     std::thread m_mtvuThread;
     std::thread::id m_mtvuThreadId;
     std::atomic<bool> m_mtvuThreadRunning{false};
     std::atomic<bool> m_mtvuEnabled{false};
+    std::atomic<bool> m_mtvuLockstep{false};
     std::atomic<uint32_t> m_mtvuPending{0};
     mutable MtvuStats m_mtvuStats;
 

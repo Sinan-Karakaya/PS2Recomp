@@ -2303,6 +2303,10 @@ void EeScheduler::processPendingEvents()
         for (const GuestInvocation &invocation : thread->invocations)
             handlerActive = handlerActive || invocation.kind == GuestInvocationKind::Interrupt;
     const uint32_t vifInterrupts = handlerActive ? 0u : m_runtime.memory().takePendingVifInterrupts();
+    // VU1 stop bits from the MTVU worker reach VPU_STAT here, like its VIF
+    // interrupts: the worker cannot write the EE's context.
+    if (R5900Context *context = currentContext())
+        m_runtime.applyMtvuStopBits(*context);
     if ((vifInterrupts & 0x1u) != 0u)
     {
         dispatchIrq(false, 4u);

@@ -308,6 +308,10 @@ public:
     bool initialize(const char *title = "PS2 Game");
     bool syncCoreSubsystems();
     void updateVu1StopBits(R5900Context &context);
+    // VU1's D/T stop bits as the MTVU worker last left them, applied to the
+    // EE's VPU_STAT at its next safe point.
+    void applyMtvuStopBits(R5900Context &context);
+    void publishMtvuStopBits();
     // VIF1/VU1 and GIF DMA on a worker thread (MTVU).
     void setMtvuEnabled(bool enabled);
     bool loadELF(const std::string &elfPath);
@@ -578,6 +582,7 @@ private:
     std::atomic<uint32_t> m_missingFunctionPolicy{static_cast<uint32_t>(MissingFunctionPolicy::ContinueToTarget)};
     std::atomic<bool> m_missingFunctionReported{false};
     std::atomic<bool> m_stopRequested{false};
+    std::atomic<uint32_t> m_mtvuStopBits{0}; // bit 31: not yet applied
     FramePumpCallback m_framePump = nullptr;
     void *m_framePumpUserData = nullptr;
     DebugUiCallback m_debugUiInitCallback = nullptr;

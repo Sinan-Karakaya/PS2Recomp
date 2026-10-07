@@ -660,6 +660,21 @@ void PS2Runtime::setMtvuEnabled(bool enabled)
     std::fprintf(stderr, "[mtvu] VU1 on its own thread: %s\n", enabled ? "on" : "off");
 }
 
+void PS2Runtime::publishMtvuStopBits()
+{
+    const uint32_t bits = (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
+                          (m_vu1.state().stoppedByT ? 0x0400u : 0u);
+    m_mtvuStopBits.store(bits | 0x80000000u, std::memory_order_release);
+}
+
+void PS2Runtime::applyMtvuStopBits(R5900Context &context)
+{
+    if ((m_mtvuStopBits.load(std::memory_order_acquire) & 0x80000000u) == 0u)
+        return;
+    const uint32_t bits = m_mtvuStopBits.exchange(0u, std::memory_order_acq_rel) & 0x0600u;
+    context.vu0_vpu_stat = (context.vu0_vpu_stat & ~0x0600u) | bits;
+}
+
 void PS2Runtime::updateVu1StopBits(R5900Context &context)
 {
     const uint32_t bits = (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
@@ -702,7 +717,9 @@ bool PS2Runtime::syncCoreSubsystems()
                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                    m_gs, &m_memory, startPC, top, itop, 65536);
                                      if (!worker)
-                                         updateVu1StopBits(*cpuContext); });
+                                         updateVu1StopBits(*cpuContext);
+                                     else
+                                         publishMtvuStopBits(); });
     m_memory.setVu1MscntCallback([this](uint32_t top, uint32_t itop)
                                  {
                                      // The MTVU worker uses the FBRST captured with its job.
@@ -719,7 +736,9 @@ bool PS2Runtime::syncCoreSubsystems()
                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                   m_gs, &m_memory, top, itop, 65536);
                                      if (!worker)
-                                         updateVu1StopBits(*cpuContext); });
+                                         updateVu1StopBits(*cpuContext);
+                                     else
+                                         publishMtvuStopBits(); });
     resetIop();
     m_vu0.reset();
     m_vu1.reset();
@@ -768,7 +787,10 @@ bool PS2Runtime::initialize(const char *title)
         }
         // PS2_MTVU=1 runs VIF1/VU1 and GIF on their own thread (2: in lockstep).
         if (const char *mtvu = std::getenv("PS2_MTVU"); mtvu && (std::strcmp(mtvu, "1") == 0 || std::strcmp(mtvu, "2") == 0))
+        {
+            m_memory.setMtvuLockstep(std::strcmp(mtvu, "2") == 0);
             setMtvuEnabled(true);
+        }
 #if defined(PS2X_IOP_ENABLE_PLUGINS) && PS2X_IOP_ENABLE_PLUGINS && \
     !defined(PLATFORM_VITA) && (defined(_WIN32) || defined(__linux__))
         std::string pluginError;

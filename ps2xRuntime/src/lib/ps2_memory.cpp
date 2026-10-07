@@ -1774,23 +1774,20 @@ void PS2Memory::processPendingTransfers()
     // MTVU: GIF (PATH3) and VIF1 (VU1, PATH1/2) data goes to the worker
     // thread with its own copy of the bytes, in order. VIF0 runs here, and the
     // channels complete at once as before: the copy is what the DMA read.
-    const bool queue = mtvuEnabled() && !onMtvuThread() &&
-                       (!m_pendingGifTransfers.empty() || !m_pendingVif1Transfers.empty());
+    // With MTVU on, GIF and VIF1 work, and the GIF arbiter, are the worker's.
+    const bool worker = mtvuEnabled() && !onMtvuThread();
+    const bool queue = worker && (!m_pendingGifTransfers.empty() || !m_pendingVif1Transfers.empty());
     const bool hadGif = !m_pendingGifTransfers.empty();
     const bool hadVif1Queued = !m_pendingVif1Transfers.empty();
     if (queue)
     {
         mtvuEnqueue(m_pendingGifTransfers, m_pendingVif1Transfers);
-        // PS2_MTVU=2: the same hand-off, waited for at once, which must
+        // Lockstep: the same hand-off, waited for at once, which must
         // reproduce single-threaded output exactly. A check of the plumbing.
-        static const bool lockstep = [] {
-            const char *mode = std::getenv("PS2_MTVU");
-            return mode && std::strcmp(mode, "2") == 0;
-        }();
-        if (lockstep)
+        if (m_mtvuLockstep.load(std::memory_order_acquire))
             mtvuSync();
     }
-    else
+    else if (!worker)
         processGifTransfers(m_pendingGifTransfers);
     m_pendingGifTransfers.clear();
 
@@ -1853,7 +1850,7 @@ void PS2Memory::processPendingTransfers()
     m_pendingVif0Transfers.clear();
 
     const bool hadVif1 = hadVif1Queued;
-    if (!queue)
+    if (!worker)
     {
         processVif1Transfers(m_pendingVif1Transfers);
         if (m_gifArbiter)
@@ -2019,6 +2016,7 @@ void PS2Memory::mtvuRun()
         {
             std::lock_guard<std::mutex> lock(m_mtvuMutex);
             m_mtvuError = std::current_exception();
+            m_mtvuFailed.store(true, std::memory_order_release);
         }
         {
             std::lock_guard<std::mutex> lock(m_mtvuMutex);
@@ -2031,8 +2029,19 @@ void PS2Memory::mtvuRun()
 
 void PS2Memory::mtvuSync() const
 {
-    if (m_mtvuPending.load(std::memory_order_acquire) == 0u || onMtvuThread())
+    if (onMtvuThread())
         return;
+    if (m_mtvuPending.load(std::memory_order_acquire) == 0u)
+    {
+        // The last job may have failed before anyone waited for it.
+        if (m_mtvuFailed.load(std::memory_order_acquire))
+        {
+            std::lock_guard<std::mutex> lock(m_mtvuMutex);
+            if (m_mtvuError)
+                std::rethrow_exception(m_mtvuError);
+        }
+        return;
+    }
     const auto start = std::chrono::steady_clock::now();
     std::unique_lock<std::mutex> lock(m_mtvuMutex);
     m_mtvuDone.wait(lock, [&] { return m_mtvuPending.load(std::memory_order_acquire) == 0u || m_mtvuError; });
@@ -2060,6 +2069,7 @@ void PS2Memory::setMtvuEnabled(bool enabled)
             std::lock_guard<std::mutex> lock(m_mtvuMutex);
             m_mtvuStop = false;
             m_mtvuError = nullptr;
+            m_mtvuFailed.store(false, std::memory_order_release);
         }
         m_mtvuThread = std::thread([this] {
 #if defined(__linux__)
