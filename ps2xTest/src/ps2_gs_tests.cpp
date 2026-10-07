@@ -4,6 +4,7 @@
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
 #include "runtime/gs/gs_frontend.h"
+#include "runtime/gs/gs_threaded_backend.h"
 #include "runtime/ee_scheduler.h"
 #include "runtime/gs/ps2_gs_memory.h"
 #include "runtime/gs/ps2_gs_psmct32.h"
@@ -16,6 +17,8 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <memory>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -410,10 +413,79 @@ namespace
     }
 }
 
+namespace
+{
+    // Records the draws a GS worker hands over, by their first vertex's red.
+    class DrawRecorder : public GSRasterBackend
+    {
+    public:
+        explicit DrawRecorder(std::vector<uint32_t> &draws, std::mutex &mutex) : m_draws(draws), m_mutex(mutex) {}
+        void Initialize(uint8_t *, uint32_t) override {}
+        void Reset() override {}
+        void Submit(const GSPrimitiveBatch &batch) override
+        {
+            std::lock_guard lock(m_mutex);
+            m_draws.push_back(batch.vertices[0].r);
+        }
+        void BeginTransfer(const GSTransferCommand &) override {}
+        void UploadImage(const uint8_t *, uint32_t) override {}
+        void Flush() override {}
+        void TextureFlush() override {}
+        void Sync(GSSyncReason) override {}
+        PresentationFrame Present(const GSPresentationRequest &) override { return {}; }
+        bool ClearFramebuffer(const GSContext &, uint32_t) override { return false; }
+        uint32_t ConsumeLocalToHostBytes(uint8_t *, uint32_t) override { return 0u; }
+        uint32_t ReadVram(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) const override { return 0u; }
+        void WriteVram(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) override {}
+        void SnapshotVram(std::vector<uint8_t> &out) const override { out.clear(); }
+        GSTransferSnapshot GetTransferSnapshot() const override { return {}; }
+
+    private:
+        std::vector<uint32_t> &m_draws;
+        std::mutex &m_mutex;
+    };
+
+    bool waitForDraws(const std::vector<uint32_t> &draws, std::mutex &mutex, size_t count)
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline)
+        {
+            {
+                std::lock_guard lock(mutex);
+                if (draws.size() >= count)
+                    return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return false;
+    }
+}
+
 void register_ps2_gs_tests()
 {
     MiniTest::Case("PS2GS", [](TestCase &tc)
     {
+        tc.Run("idle GS worker takes a short run of draws without a flush", [](TestCase &t)
+        {
+            std::vector<uint32_t> draws;
+            std::mutex mutex;
+            GSThreadedBackend worker(std::make_unique<DrawRecorder>(draws, mutex));
+            GSPrimitiveBatch batch{};
+            batch.vertices[0].r = 1u;
+            worker.Submit(batch);
+            t.IsTrue(waitForDraws(draws, mutex, 1u), "a lone draw should reach the backend with no flush or sync");
+
+            // Fewer draws than the worker takes as a group when it is idle.
+            for (uint32_t i = 2u; i <= 6u; ++i)
+            {
+                batch.vertices[0].r = static_cast<uint8_t>(i);
+                worker.Submit(batch);
+            }
+            t.IsTrue(waitForDraws(draws, mutex, 6u), "a short run of draws should not wait for more");
+            std::lock_guard lock(mutex);
+            t.IsTrue(draws == std::vector<uint32_t>({1u, 2u, 3u, 4u, 5u, 6u}), "draws should arrive in order");
+        });
+
         tc.Run("GS CSR/IMR support coherent 64-bit and 32-bit access", [](TestCase &t)
         {
             PS2Memory mem;
