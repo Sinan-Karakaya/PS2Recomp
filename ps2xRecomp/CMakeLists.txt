@@ -120,6 +120,18 @@ PRIVATE
     ps2_recomp_lib
 )
 
+# Windows reads argv, and every path given to fopen or std::ifstream, in the
+# ANSI code page, but a config's paths are UTF-8: under a user folder with an
+# accented name the input ELF never opened, and a name outside that code page
+# reached argv as question marks. Since Windows 10 1903 this manifest makes
+# the process code page UTF-8.
+if(MSVC)
+    # Merged into the manifest the linker writes.
+    target_sources(ps2_recomp PRIVATE utf8.manifest)
+elseif(MINGW)
+    target_sources(ps2_recomp PRIVATE utf8.rc)
+endif()
+
 install(TARGETS ps2_recomp ps2_recomp_lib
     RUNTIME DESTINATION bin
     LIBRARY DESTINATION lib
