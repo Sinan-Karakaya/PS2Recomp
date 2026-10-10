@@ -352,6 +352,7 @@ void EeScheduler::run()
             {
                 GuestInvocation completed = std::move(running->invocations.back());
                 running->invocations.pop_back();
+                releaseInvocationStack(running->id, running->invocations.size());
                 if (completed.onComplete)
                 {
                     try
@@ -1516,6 +1517,20 @@ uint32_t EeScheduler::invocationStackTop()
     return top;
 }
 
+// A stack is only in use while its invocation runs: interrupts land on
+// whichever thread is current, so holding it until the thread exits drained
+// the pool on threads that took one interrupt and lived on.
+void EeScheduler::releaseInvocationStack(int threadId, size_t depth)
+{
+    const uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(threadId)) << 32u) |
+                         static_cast<uint32_t>(depth);
+    const auto held = m_invocationStackTops.find(key);
+    if (held == m_invocationStackTops.end())
+        return;
+    m_freeInvocationStacks.push_back(held->second);
+    m_invocationStackTops.erase(held);
+}
+
 // Stacks are keyed per (thread, depth) and the pool only bumps down, so without
 // this every thread that ever took an invocation holds 16 KiB forever -- DQ8
 // starts one thread per movie and drained all 16 slots on the second one.
@@ -2282,7 +2297,17 @@ void EeScheduler::processPendingEvents()
         }
     }
     // INTC VIF0 (4) and VIF1 (5), raised by a VIFcode carrying the i bit.
-    const uint32_t vifInterrupts = m_runtime.memory().takePendingVifInterrupts();
+    // The EE takes no interrupt while it handles one, so VIF interrupts wait
+    // until the thread about to resume has no handler on its invocation stack.
+    bool handlerActive = m_insideInterrupt;
+    if (const GuestThread *thread = currentThread(); thread && !handlerActive)
+        for (const GuestInvocation &invocation : thread->invocations)
+            handlerActive = handlerActive || invocation.kind == GuestInvocationKind::Interrupt;
+    const uint32_t vifInterrupts = handlerActive ? 0u : m_runtime.memory().takePendingVifInterrupts();
+    // VU1 stop bits from the MTVU worker reach VPU_STAT here, like its VIF
+    // interrupts: the worker cannot write the EE's context.
+    if (R5900Context *context = currentContext())
+        m_runtime.applyMtvuStopBits(*context);
     if ((vifInterrupts & 0x1u) != 0u)
     {
         dispatchIrq(false, 4u);
