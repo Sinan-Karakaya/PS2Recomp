@@ -8,8 +8,12 @@
 #include "Stubs/GS.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <stdexcept>
+#include <string>
+#include <thread>
 #include <vector>
 
 namespace
@@ -60,6 +64,47 @@ namespace
     }
 
     uint64_t makeGifTag(uint16_t nloop, uint8_t flg, uint8_t nreg, bool eop);
+
+    constexpr uint32_t kMtvuGifCh = 0x1000A000u;
+    constexpr uint32_t kMtvuVif1Ch = 0x10009000u;
+    constexpr uint32_t kMtvuVif1Mark = 0x10003C30u;
+
+    // Starts a normal-mode DMA of `qwords` from `src` on `channel`.
+    void startDma(PS2Memory &mem, uint32_t channel, uint32_t src, const std::vector<uint8_t> &qwords)
+    {
+        std::memcpy(mem.getRDRAM() + src, qwords.data(), qwords.size());
+        mem.writeIORegister(channel + 0x10u, src);
+        mem.writeIORegister(channel + 0x20u, static_cast<uint32_t>(qwords.size() / 16u));
+        mem.writeIORegister(channel + 0x00u, 0x100u);
+    }
+
+    // One GIF quadword whose first byte tells the packets apart.
+    std::vector<uint8_t> markedQuadword(uint8_t marker)
+    {
+        std::vector<uint8_t> qw(16u, 0u);
+        qw[0] = marker;
+        return qw;
+    }
+
+    // VIF1 code padded to whole quadwords.
+    std::vector<uint8_t> padToQuadwords(std::vector<uint8_t> words)
+    {
+        words.resize((words.size() + 15u) & ~size_t(15u), 0u);
+        return words;
+    }
+
+    // VIF1: DIRECT with one quadword of GIF data starting with `marker`.
+    std::vector<uint8_t> vifDirect(uint8_t marker)
+    {
+        std::vector<uint8_t> code;
+        appendU32(code, 0u);
+        appendU32(code, 0u);
+        appendU32(code, 0u);
+        appendU32(code, makeVifCmd(0x50u, 0u, 1u)); // DIRECT, 1 QW, quadword aligned
+        const std::vector<uint8_t> qw = markedQuadword(marker);
+        code.insert(code.end(), qw.begin(), qw.end());
+        return code;
+    }
 
     uint64_t makeBitbltbuf(uint32_t dbp, uint32_t dbw, uint32_t dpsm)
     {
@@ -958,6 +1003,158 @@ void register_ps2_memory_tests()
             t.Equals(firstBytes.size(), static_cast<size_t>(2u), "PATH3 and DIRECTHL packets should both drain");
             t.Equals(firstBytes[0], static_cast<uint8_t>(0xAAu), "DIRECTHL should not preempt queued PATH3 IMAGE packet");
             t.Equals(firstBytes[1], static_cast<uint8_t>(0xD2u), "DIRECTHL packet should drain after PATH3 IMAGE packet");
+        });
+
+        tc.Run("MTVU runs GIF and VIF1 transfers on its thread, in the order they started", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            std::vector<uint8_t> order;
+            std::vector<std::thread::id> threads;
+            mem.setGifPacketCallback([&](const uint8_t *data, uint32_t sizeBytes)
+            {
+                if (sizeBytes != 0u)
+                    order.push_back(data[0]);
+                threads.push_back(std::this_thread::get_id());
+            });
+            mem.setMtvuEnabled(true);
+
+            startDma(mem, kMtvuGifCh, 0x00022000u, markedQuadword(0xA1u));
+            mem.processPendingTransfers();
+            startDma(mem, kMtvuVif1Ch, 0x00023000u, vifDirect(0xB2u));
+            mem.processPendingTransfers();
+            startDma(mem, kMtvuGifCh, 0x00024000u, markedQuadword(0xC3u));
+            mem.processPendingTransfers();
+            mem.mtvuSync();
+
+            t.IsTrue(order == std::vector<uint8_t>({0xA1u, 0xB2u, 0xC3u}), "packets should reach the GS in start order");
+            t.IsTrue(!threads.empty() && std::all_of(threads.begin(), threads.end(),
+                                                     [](std::thread::id id) { return id != std::this_thread::get_id(); }),
+                     "the transfers should run on the MTVU thread");
+            mem.setMtvuEnabled(false);
+        });
+
+        tc.Run("MTVU: reading VU1 memory waits for queued VIF1 work", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            std::memset(mem.getVU1Data(), 0, PS2_VU1_DATA_SIZE);
+            // The GIF packet ahead of the VIF1 code holds the worker up, so a
+            // read that did not wait would see the old VU1 memory.
+            mem.setGifPacketCallback([&](const uint8_t *, uint32_t)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            });
+            mem.setMtvuEnabled(true);
+
+            std::vector<uint8_t> unpack;
+            appendU32(unpack, makeVifCmd(0x01u, 0u, static_cast<uint16_t>((1u << 8) | 1u))); // STCYCL 1/1
+            appendU32(unpack, makeVifCmd(0x6Cu, 1u, 0u)); // UNPACK V4-32, 1 vector at 0
+            for (uint32_t value : {0x12345678u, 2u, 3u, 4u})
+                appendU32(unpack, value);
+            startDma(mem, kMtvuGifCh, 0x00022000u, markedQuadword(0xA1u));
+            startDma(mem, kMtvuVif1Ch, 0x00023000u, padToQuadwords(unpack));
+            mem.processPendingTransfers();
+
+            t.Equals(mem.read32(PS2_VU1_DATA_BASE), 0x12345678u, "VU1 memory should show the queued UNPACK");
+            mem.setMtvuEnabled(false);
+        });
+
+        tc.Run("MTVU: handing transfers off does not wait for the worker", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            mem.setGifPacketCallback([](const uint8_t *, uint32_t)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            });
+            mem.setMtvuEnabled(true);
+            const auto start = std::chrono::steady_clock::now();
+            startDma(mem, kMtvuGifCh, 0x00022000u, markedQuadword(0xA1u));
+            mem.processPendingTransfers();
+            mem.processPendingTransfers(); // nothing new: must not wait either
+            const auto elapsed = std::chrono::steady_clock::now() - start;
+            t.IsTrue(elapsed < std::chrono::milliseconds(100), "the EE should go on while the worker is busy");
+            mem.mtvuSync();
+            mem.setMtvuEnabled(false);
+        });
+
+        tc.Run("MTVU threaded and lockstep give the same GS packets and VU memory as inline", [](TestCase &t)
+        {
+            // VIF1: STCYCL, an UNPACK into VU1 memory and a DIRECT; then GIF.
+            std::vector<uint8_t> vif;
+            appendU32(vif, makeVifCmd(0x01u, 0u, static_cast<uint16_t>((4u << 8) | 4u)));
+            appendU32(vif, makeVifCmd(0x6Cu, 3u, 0x0010u)); // UNPACK V4-32, 3 vectors at 0x10
+            for (uint32_t i = 0; i < 12u; ++i)
+                appendU32(vif, 0x01000000u * (i + 1u) + i);
+            appendU32(vif, 0u);
+            const std::vector<uint8_t> direct = vifDirect(0xD4u);
+            vif.insert(vif.end(), direct.begin() + 4, direct.end()); // keep the DIRECT quadword aligned
+
+            struct Result
+            {
+                std::vector<std::vector<uint8_t>> packets;
+                std::vector<uint8_t> vu1;
+            };
+            auto run = [&](int mode) // 0 inline, 1 threaded, 2 lockstep
+            {
+                Result result;
+                PS2Memory mem;
+                mem.initialize();
+                std::memset(mem.getVU1Data(), 0, PS2_VU1_DATA_SIZE);
+                mem.setGifPacketCallback([&](const uint8_t *data, uint32_t sizeBytes)
+                {
+                    result.packets.emplace_back(data, data + sizeBytes);
+                });
+                mem.setMtvuLockstep(mode == 2);
+                mem.setMtvuEnabled(mode != 0);
+                for (uint32_t round = 0; round < 3u; ++round)
+                {
+                    startDma(mem, kMtvuVif1Ch, 0x00030000u + round * 0x1000u, padToQuadwords(vif));
+                    mem.processPendingTransfers();
+                    startDma(mem, kMtvuGifCh, 0x00038000u + round * 0x100u, markedQuadword(static_cast<uint8_t>(0xE0u + round)));
+                    mem.processPendingTransfers();
+                }
+                mem.mtvuSync();
+                const uint8_t *vu1 = mem.getVU1Data();
+                result.vu1.assign(vu1, vu1 + 0x200u);
+                mem.setMtvuEnabled(false);
+                return result;
+            };
+            const Result inlineRun = run(0), threaded = run(1), lockstep = run(2);
+            t.Equals(inlineRun.packets.size(), static_cast<size_t>(6u), "inline should send six packets");
+            t.IsTrue(threaded.packets == inlineRun.packets, "threaded MTVU should send the same packets");
+            t.IsTrue(lockstep.packets == inlineRun.packets, "lockstep MTVU should send the same packets");
+            t.IsTrue(threaded.vu1 == inlineRun.vu1, "threaded MTVU should leave the same VU1 memory");
+            t.IsTrue(lockstep.vu1 == inlineRun.vu1, "lockstep MTVU should leave the same VU1 memory");
+        });
+
+        tc.Run("MTVU reports a failed job even after it has finished", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            mem.setGifPacketCallback([](const uint8_t *, uint32_t) { throw std::runtime_error("GS failure"); });
+            mem.setMtvuEnabled(true);
+            auto failure = [](auto &&step) -> std::string
+            {
+                try
+                {
+                    step();
+                }
+                catch (const std::exception &error)
+                {
+                    return error.what();
+                }
+                return {};
+            };
+            startDma(mem, kMtvuGifCh, 0x00022000u, markedQuadword(0xA1u));
+            failure([&] { mem.processPendingTransfers(); }); // may already see it
+            // Long enough for the worker to fail and retire the job.
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            t.Equals(failure([&] { mem.mtvuSync(); }), std::string("GS failure"),
+                     "mtvuSync should rethrow the failure once nothing is pending");
+            mem.setGifPacketCallback(nullptr);
+            mem.setMtvuEnabled(false);
         });
 
         tc.Run("GIF DMA mode0 copies RDRAM packet and clears channel", [](TestCase &t)
