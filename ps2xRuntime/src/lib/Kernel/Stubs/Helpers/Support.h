@@ -1,4 +1,5 @@
 #include <algorithm>
+#include "runtime/ps2_display_flips.h"
 #include <cctype>
 
 namespace
@@ -1882,6 +1883,8 @@ namespace
         if (!runtime || !runtime->syncCoreSubsystems())
             return;
         auto &regs = runtime->memory().gs();
+        if (regs.dispfb1 != env.dispfb || regs.dispfb2 != env.dispfb)
+            ps2_display_flips::noteFlip();
         regs.pmode = env.pmode;
         regs.smode2 = env.smode2;
         regs.dispfb1 = env.dispfb;

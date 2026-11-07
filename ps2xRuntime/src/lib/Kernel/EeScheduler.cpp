@@ -76,6 +76,8 @@ namespace
     constexpr auto kVBlankPeriod = std::chrono::microseconds(16667);
     constexpr auto kVBlankDuration = std::chrono::microseconds(500);
     constexpr uint64_t kAlarmTickMicroseconds = 64u;
+    // The external-wait type of EeScheduler::waitHostDeadline.
+    constexpr uint32_t kHostDeadlineWaitType = 0x48445750u; // 'HDWP'
     constexpr uint32_t kDebugPublishDispatchInterval = 4096u;
 
     constexpr uint64_t microsecondsToEeCycles(uint64_t microseconds)
@@ -1768,6 +1770,22 @@ void EeScheduler::completeExternalWait(uint32_t type, uint64_t token, int result
         makeReady(*waiter, result, false);
     }
     publishSnapshot();
+}
+
+[[noreturn]] void EeScheduler::waitHostDeadline(std::chrono::steady_clock::time_point deadline, uint32_t resumePc)
+{
+    assertExecutor();
+    // Scheduled like a VBlank, with a cycle deadline that matches the host
+    // one, so the idle wait's ordering by cycle agrees with the host order.
+    const auto now = pacingNow();
+    const auto remaining = deadline > now ? deadline - now : std::chrono::steady_clock::duration::zero();
+    const auto microseconds = std::chrono::duration_cast<std::chrono::microseconds>(remaining).count();
+    // A wait of over ten seconds is not a frame; it is capped, not honoured.
+    const uint64_t cycles = microsecondsToEeCycles(static_cast<uint64_t>(std::min<long long>(microseconds, 10000000ll)));
+    const uint64_t token = ++m_hostDeadlineSequence;
+    scheduleEvent(m_eeCycle + cycles, deadline, EeEvent{EeEventType::ExternalWake, kHostDeadlineWaitType, token});
+    waitExternal(EeWaitReason::External, kHostDeadlineWaitType, token,
+                 [resumePc](R5900Context &context) { context.pc = resumePc; });
 }
 
 [[noreturn]] void EeScheduler::waitExternal(EeWaitReason reason,

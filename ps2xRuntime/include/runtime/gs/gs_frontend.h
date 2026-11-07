@@ -171,6 +171,7 @@ private:
     void processImageData(const uint8_t *data, uint32_t sizeBytes);
     bool tryProcessNativeImageUploadPacket(const uint8_t *data, uint32_t sizeBytes);
     GSPrimitiveBatch buildDrawBatch(int vertexCount) const;
+    void fillDrawBatch(GSPrimitiveBatch &batch, int vertexCount) const;
     void updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch);
     GSPresentationRequest buildPresentationRequestUnlocked() const;
 

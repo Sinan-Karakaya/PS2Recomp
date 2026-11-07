@@ -1,4 +1,5 @@
 #include "ps2_runtime.h"
+#include "runtime/ps2_display_flips.h"
 #include "ps2_log.h"
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
@@ -91,6 +92,43 @@ struct ProgramHeader
 
 namespace
 {
+    // The EE clock advances with the guest's instructions; it does not know
+    // about the VU1 programs and GIF packets the runtime runs on the same
+    // thread where hardware has other units. When that thread is saturated the
+    // guest's time then lags the host's and the game plays in slow motion. So
+    // the host pacing time such work takes is charged to the EE clock, which
+    // cannot make a VBlank fire before its host deadline but keeps guest time
+    // moving while the thread is busy. PS2X_HOST_WORK_CYCLES=0 turns it off.
+    const bool g_chargeHostWork = [] {
+        const char *value = std::getenv("PS2X_HOST_WORK_CYCLES");
+        return !value || !*value || std::strcmp(value, "0") != 0;
+    }();
+    // Cap one charge at a field: a stall of the host (a debugger, a page-in)
+    // is not guest time.
+    constexpr uint64_t kHostWorkChargeCapCycles = EeScheduler::kEeClockHz / 60u;
+
+    std::chrono::steady_clock::time_point hostWorkStart(const EeScheduler *scheduler)
+    {
+        if (!g_chargeHostWork || !scheduler)
+            return {};
+        return scheduler->hostPacingNow();
+    }
+
+    void chargeHostWork(EeScheduler *scheduler, std::chrono::steady_clock::time_point start)
+    {
+        if (!g_chargeHostWork || !scheduler || start == std::chrono::steady_clock::time_point{})
+            return;
+        const auto elapsed = scheduler->hostPacingNow() - start;
+        if (elapsed <= std::chrono::steady_clock::duration::zero())
+            return;
+        const uint64_t nanoseconds =
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count());
+        const uint64_t cycles = std::min<uint64_t>(nanoseconds * EeScheduler::kEeClockHz / 1000000000ull,
+                                                   kHostWorkChargeCapCycles);
+        if (cycles != 0u)
+            scheduler->accountCycles(static_cast<uint32_t>(cycles));
+    }
+
     template <class Present>
     bool presentHostFrame(PS2Runtime &runtime, Present &&present)
     {
@@ -662,10 +700,15 @@ bool PS2Runtime::syncCoreSubsystems()
 
     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
-                                    { m_gs.processGIFPacket(data, size); });
+                                    {
+                                        const auto start = hostWorkStart(m_eeScheduler.get());
+                                        m_gs.processGIFPacket(data, size);
+                                        chargeHostWork(m_eeScheduler.get(), start);
+                                    });
     m_memory.setGifArbiter(&m_gifArbiter);
     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
                                  {
+                                     const auto start = hostWorkStart(m_eeScheduler.get());
                                      R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
                                      if (!cpuContext)
                                      {
@@ -681,9 +724,11 @@ bool PS2Runtime::syncCoreSubsystems()
                                      cpuContext->vu0_vpu_stat =
                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
-                                         (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
+                                         (m_vu1.state().stoppedByT ? 0x0400u : 0u);
+                                     chargeHostWork(m_eeScheduler.get(), start); });
     m_memory.setVu1MscntCallback([this](uint32_t top, uint32_t itop)
                                  {
+                                     const auto start = hostWorkStart(m_eeScheduler.get());
                                      R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
                                      if (!cpuContext)
                                      {
@@ -699,7 +744,8 @@ bool PS2Runtime::syncCoreSubsystems()
                                      cpuContext->vu0_vpu_stat =
                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
-                                         (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
+                                         (m_vu1.state().stoppedByT ? 0x0400u : 0u);
+                                     chargeHostWork(m_eeScheduler.get(), start); });
     resetIop();
     m_vu0.reset();
     m_vu1.reset();
@@ -2581,13 +2627,18 @@ void PS2Runtime::run()
         if (m_framePump)
         {
             static uint64_t s_lastNativeTick = std::numeric_limits<uint64_t>::max();
+            static uint64_t s_lastFlip = std::numeric_limits<uint64_t>::max();
             const uint64_t currentTick = eeScheduler().currentVSyncTick();
-            const bool newFrame = currentTick != s_lastNativeTick;
+            // A game paced faster than the VBlank flips its display buffer
+            // more often than the tick advances; each flip is a frame.
+            const uint64_t flip = ps2_display_flips::count();
+            const bool newFrame = currentTick != s_lastNativeTick || flip != s_lastFlip;
             if (newFrame)
             {
                 if (!presentHostFrame(*this, [&] { gs().latchHostPresentationFrame(); }))
                     break;
                 s_lastNativeTick = currentTick;
+                s_lastFlip = flip;
             }
             else
             {

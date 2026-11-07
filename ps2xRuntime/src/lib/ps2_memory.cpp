@@ -1374,7 +1374,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     std::array<uint32_t, 4> cycleCheckpoint{tagAddr, asr0, asr1, asp};
                     uint64_t cyclePower = 1u;
                     uint64_t cycleDistance = 0u;
-                    std::vector<uint8_t> chainBuf;
+                    std::vector<uint8_t> chainBuf = takeChainBuffer();
 
                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
                     {
@@ -1621,6 +1621,29 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
     return false;
 }
 
+std::vector<uint8_t> PS2Memory::takeChainBuffer()
+{
+    if (m_chainBufferPool.empty())
+        return {};
+    std::vector<uint8_t> buffer = std::move(m_chainBufferPool.back());
+    m_chainBufferPool.pop_back();
+    buffer.clear();
+    return buffer;
+}
+
+void PS2Memory::recycleChainBuffers(std::vector<PendingTransfer> &transfers)
+{
+    // A few buffers cover the chains one kick queues; the rest are freed.
+    constexpr size_t kPoolSize = 8u;
+    for (auto &transfer : transfers)
+    {
+        if (transfer.chainData.capacity() == 0u || m_chainBufferPool.size() >= kPoolSize)
+            continue;
+        transfer.chainData.clear();
+        m_chainBufferPool.push_back(std::move(transfer.chainData));
+    }
+}
+
 void PS2Memory::processPendingTransfers()
 {
     const bool hadGif = !m_pendingGifTransfers.empty();
@@ -1686,6 +1709,7 @@ void PS2Memory::processPendingTransfers()
             }
         }
     }
+    recycleChainBuffers(m_pendingGifTransfers);
     m_pendingGifTransfers.clear();
 
     const bool hadVif0 = !m_pendingVif0Transfers.empty();
@@ -1744,6 +1768,7 @@ void PS2Memory::processPendingTransfers()
             }
         }
     }
+    recycleChainBuffers(m_pendingVif0Transfers);
     m_pendingVif0Transfers.clear();
 
     const bool hadVif1 = !m_pendingVif1Transfers.empty();
@@ -1802,6 +1827,7 @@ void PS2Memory::processPendingTransfers()
             }
         }
     }
+    recycleChainBuffers(m_pendingVif1Transfers);
     m_pendingVif1Transfers.clear();
 
     if (m_gifArbiter)

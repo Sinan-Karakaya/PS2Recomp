@@ -110,6 +110,29 @@ struct GSThreadedBackend::Impl
             publishStaged(flush);
     }
 
+    // A packet's primitives under one lock: the per-call lock was measurable
+    // at DQ8's million primitives a second.
+    void enqueueMany(const GSPrimitiveBatch *const *batches, size_t count)
+    {
+        if (count == 0u)
+            return;
+        std::lock_guard submitLock(submission);
+        if (failed.load(std::memory_order_acquire))
+        {
+            std::lock_guard lock(mutex);
+            rethrow();
+        }
+        staged.reserve(staged.size() + count);
+        for (size_t i = 0u; i < count; ++i)
+        {
+            staged.push_back({Op::Submit, *batches[i]});
+            stagedBytes += staged.back().bytes();
+        }
+        if (staged.size() >= kStageCommands || stagedBytes >= std::min(kStageBytes, capacity) ||
+            idle.load(std::memory_order_acquire))
+            publishStaged(false);
+    }
+
     // The worker's side of publishStaged, when it is idle: nothing outstanding,
     // so no capacity to wait for. Caller holds `submission`, not `mutex`.
     void takeStaged()
@@ -372,6 +395,10 @@ void GSThreadedBackend::Reset() { m_impl->observe([](auto &b) { b.Reset(); }); }
 void GSThreadedBackend::Submit(const GSPrimitiveBatch &batch)
 {
     m_impl->enqueue({Impl::Op::Submit, batch});
+}
+void GSThreadedBackend::SubmitMany(const GSPrimitiveBatch *const *batches, size_t count)
+{
+    m_impl->enqueueMany(batches, count);
 }
 void GSThreadedBackend::BeginTransfer(const GSTransferCommand &command)
 {
