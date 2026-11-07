@@ -23,13 +23,24 @@ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeByte
     if (!data || sizeBytes < 16 || !m_processFn)
         return;
 
+    // drain() sorts PATH1 ahead of every PATH2 and PATH3 packet it holds, and
+    // nothing submitted later can move ahead of it, so processing it now gives
+    // the same order as queueing it until the next drain. DQ8's VU1 kicks
+    // thousands of these a frame; copying and sorting each one was measurable.
+    if (pathId == GifPathId::Path1)
+    {
+        m_processFn(data, sizeBytes);
+        return;
+    }
+
     GifArbiterPacket pkt;
     pkt.pathId = pathId;
     pkt.path2DirectHl = (pathId == GifPathId::Path2) && path2DirectHl;
     pkt.path3Image = (pathId == GifPathId::Path3) && isImagePacket(data, sizeBytes);
-    pkt.data.resize(sizeBytes);
-    std::memcpy(pkt.data.data(), data, sizeBytes);
-    m_queue.push_back(std::move(pkt));
+    pkt.offset = static_cast<uint32_t>(m_bytes.size());
+    pkt.size = sizeBytes;
+    m_bytes.insert(m_bytes.end(), data, data + sizeBytes);
+    m_queue.push_back(pkt);
 }
 
 void GifArbiter::drain()
@@ -51,15 +62,24 @@ void GifArbiter::drain()
                          return pathPriority(a.pathId) < pathPriority(b.pathId);
                      });
 
-    for (size_t i = 0; i < m_queue.size(); ++i)
+    // A packet may submit more while it is processed; those belong to the
+    // next drain, so the queue is taken before anything runs.
+    std::vector<GifArbiterPacket> queue;
+    queue.swap(m_queue);
+    std::vector<uint8_t> bytes;
+    bytes.swap(m_bytes);
+    for (const auto &pkt : queue)
     {
-        auto &pkt = m_queue[i];
-        if (!pkt.data.empty())
-        {
-            m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
-        }
+        if (pkt.size != 0u)
+            m_processFn(bytes.data() + pkt.offset, pkt.size);
     }
-    m_queue.clear();
+    // Hand the storage back so the next frame reuses the capacity.
+    queue.clear();
+    bytes.clear();
+    if (m_queue.capacity() < queue.capacity())
+        m_queue.swap(queue);
+    if (m_bytes.capacity() < bytes.capacity())
+        m_bytes.swap(bytes);
 }
 
 uint8_t GifArbiter::pathPriority(GifPathId id)

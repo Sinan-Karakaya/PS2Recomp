@@ -353,6 +353,14 @@ public:
     uint32_t setGsVSyncCallback(uint32_t callback, uint32_t gp, uint32_t sp);
 
     [[noreturn]] void waitVSync(uint64_t afterTick, int fixedResult = -1, std::function<void(R5900Context &)> completion = {});
+    // Blocks the current thread until host pacing time reaches `deadline`,
+    // then resumes it at `resumePc` with v0 = 0. The wait follows pause,
+    // speed and the unpaced mode like a VBlank: it is also due in guest
+    // cycles, so a guest that is behind real time is not hurried along. For
+    // a frame pacer that runs the game at a rate other than the VBlank's.
+    [[noreturn]] void waitHostDeadline(std::chrono::steady_clock::time_point deadline, uint32_t resumePc);
+    // The host clock those waits are measured on. Any thread.
+    [[nodiscard]] std::chrono::steady_clock::time_point hostPacingNow() const { return pacingNow(); }
     void completeVSync(uint64_t tick);
     void completeExternalWait(uint32_t type, uint64_t token, int result);
     [[noreturn]] void waitExternal(EeWaitReason reason, uint32_t type, uint64_t token, std::function<void(R5900Context &)> completion = {});
@@ -540,6 +548,7 @@ private:
     std::deque<GuestInvocation> m_pendingInvocations;
     uint64_t m_eventSequence = 0;
     uint64_t m_invocationSequence = 0;
+    uint64_t m_hostDeadlineSequence = 0;
     uint64_t m_vsyncTick = 0;
     uint32_t m_vsyncFlagAddress = 0;
     uint32_t m_vsyncTickAddress = 0;

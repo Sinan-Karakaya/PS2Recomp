@@ -179,10 +179,21 @@ def constant_target(pairs, block_start, jump_index):
     return None
 
 
+# FSEQ, FSAND and FSOR read the status flags, whose sticky bits take every
+# FMAC result: while an image has one, every FMAC's flags are live. Anything
+# in the image counts, data included, which can only keep flags alive.
+STATUS_READERS = (0x14, 0x16, 0x17)
+
+
+def reads_status(pairs):
+    return any(not pair.immediate and pair.lower >> 25 in STATUS_READERS for pair in pairs)
+
+
 class Routine:
-    def __init__(self, pairs, entry):
+    def __init__(self, pairs, entry, status_observed=True):
         self.pairs = pairs
         self.entry = entry
+        self.status_observed = status_observed
         self.blocks = {}   # start -> (pair indices, terminator)
         self.calls = set() # further routine entries this one can reach
         self.build()
@@ -424,7 +435,8 @@ def emit_routine(routine, name, max_pairs):
         table = f"{name}_{start:04x}"
         if body:
             words = ", ".join(f"0x{pairs[i].word:016x}ull" for i in body)
-            tables.append(f"constexpr Block<{len(body)}> {table}{{{pc(start)}, {{{words}}}}};")
+            observed = "true" if routine.status_observed else "false"
+            tables.append(f"constexpr Block<{len(body)}> {table}{{{pc(start)}, {{{words}}}, {observed}}};")
 
         def emit_pair(index, next_pc, checked=True):
             call = f"p.pair<{table}, {index - start}>({next_pc})"
@@ -521,6 +533,7 @@ def main():
         parser.error(f"--max-routine-pairs must be at least {MAX_BLOCK_PAIRS}")
 
     images, entries = load_images(args.profiles, parser)
+    status_observed = {name: reads_status(pairs) for name, pairs in images.items()}
     routines = {}
     for name, entry in entries:
         pairs = images[name]
@@ -530,8 +543,10 @@ def main():
             if start in seen or start >= PAIRS:
                 continue
             seen.add(start)
-            routine = Routine(pairs, start)
-            routines.setdefault(routine.key(), routine)
+            routine = Routine(pairs, start, status_observed[name])
+            # The same code in another image that does read status keeps its flags.
+            existing = routines.setdefault(routine.key(), routine)
+            existing.status_observed = existing.status_observed or routine.status_observed
             work.extend(routine.calls)
 
     output = args.output

@@ -17,6 +17,7 @@ public:
     void Initialize(uint8_t *vram, uint32_t size) override;
     void Reset() override;
     void Submit(const GSPrimitiveBatch &batch) override;
+    void SubmitMany(const GSPrimitiveBatch *const *batches, size_t count) override;
     void BeginTransfer(const GSTransferCommand &command) override;
     void UploadImage(const uint8_t *data, uint32_t size) override;
     void Flush() override;

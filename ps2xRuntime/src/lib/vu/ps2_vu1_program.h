@@ -149,6 +149,11 @@ struct Block
 {
     uint32_t pc;
     uint64_t words[N]; // lower | upper << 32
+    // Whether anything in the image reads the status flags (FSAND, FSEQ,
+    // FSOR). Their sticky bits collect every FMAC result, so while they can
+    // be read every FMAC's flags are live; compile_vu_programs.py clears this
+    // for an image without such a read.
+    bool statusObserved = true;
 };
 
 // No compiled pair writes a VF or VI register with a longer latency.
@@ -169,6 +174,49 @@ constexpr uint8_t viWritten(const Access::Usage &usage)
 {
     const uint16_t writes = usage.viWrite & 0xFFFEu;
     return writes != 0u ? static_cast<uint8_t>(std::countr_zero(writes)) : 0u;
+}
+
+constexpr bool upperPublishesFlags(uint32_t upper);
+
+// Whether the MAC and status flags an FMAC pair publishes can still be read.
+// A later FMAC replaces them in the MAC register once its result has been
+// committed, four cycles after it issued; a pair issues at least one cycle
+// after the one before it, so a writer k with k + 4 <= j is committed by the
+// time pair j runs whatever stalls came between. The flags of pair Index are
+// dead when such a writer sits between it and every reader in the block
+// (FMAND, FMEQ, FMOR), and between it and the block's end, where the next
+// block might read them. Status flags stay live for the whole image while it
+// has a status read, since their sticky bits take every result.
+template <const auto &Code, uint32_t Index>
+constexpr bool flagsObserved()
+{
+    if (Code.statusObserved)
+        return true;
+    constexpr uint32_t count = static_cast<uint32_t>(sizeof(Code.words) / sizeof(Code.words[0]));
+    const auto writes = [](uint32_t index) {
+        const uint32_t upper = static_cast<uint32_t>(Code.words[index] >> 32u);
+        return upperPublishesFlags(upper) && ((upper >> 21u) & 15u) != 0u;
+    };
+    const auto reads = [](uint32_t index) {
+        const uint64_t word = Code.words[index];
+        if ((static_cast<uint32_t>(word >> 32u) & 0x80000000u) != 0u)
+            return false; // the lower half is an immediate
+        const uint32_t opcode = static_cast<uint32_t>(word) >> 25u;
+        return opcode == 0x18u || opcode == 0x1Au || opcode == 0x1Bu;
+    };
+    // The nearest later writer, if any; readers up to three pairs after it
+    // may still see Index.
+    uint32_t writer = count;
+    for (uint32_t k = Index + 1u; k < count; ++k)
+        if (writes(k))
+        {
+            writer = k;
+            break;
+        }
+    for (uint32_t j = Index + 1u; j < count; ++j)
+        if (reads(j) && writer + 4u > j)
+            return true;
+    return writer + 4u > count;
 }
 
 // Reads of pair Index that cannot stall: last written in the block at least its
@@ -527,7 +575,7 @@ public:
     {
         constexpr uint64_t word = Code.words[Index];
         return issue<(Code.pc + Index * 8u) & 0x3FFFu, static_cast<uint32_t>(word), static_cast<uint32_t>(word >> 32u),
-                     settledReads<Code, Index>()>(nextPc);
+                     settledReads<Code, Index>(), flagsObserved<Code, Index>()>(nextPc);
     }
 
     // Return to the driver, which continues with the routine at pc.
@@ -593,6 +641,12 @@ private:
     template <uint8_t Mask, class T>
     static PS2_VU_FORCE_INLINE void applyLanes(T *target, const T *value)
     {
+        // All four lanes: one 16-byte move rather than four stores.
+        if constexpr (Mask == 0xFu && sizeof(T) == 4u)
+        {
+            std::memcpy(target, value, 16u);
+            return;
+        }
         if constexpr ((Mask & 8u) != 0u)
             target[0] = value[0];
         if constexpr ((Mask & 4u) != 0u)
@@ -615,7 +669,7 @@ private:
         return absolute > m_base ? static_cast<uint32_t>(absolute - m_base) : 0u;
     }
 
-    template <uint32_t Pc, uint32_t Lower, uint32_t Upper, uint32_t Settled>
+    template <uint32_t Pc, uint32_t Lower, uint32_t Upper, uint32_t Settled, bool FlagsLive>
     PS2_VU_FORCE_INLINE bool issue(uint32_t nextPc);
 
     // The latest cycle an operand of the pair becomes ready, ignoring the
@@ -626,11 +680,12 @@ private:
     template <uint32_t Pc, uint32_t Lower, uint32_t Upper>
     PS2_VU_FORCE_INLINE bool stale(uint32_t nextPc);
 
-    template <uint32_t Upper>
+    template <uint32_t Upper, bool FlagsLive>
     PS2_VU_FORCE_INLINE void upper(float *value);
 
 #if PS2_VU_PROGRAM_NEON || PS2_VU_PROGRAM_SSE
-    template <uint32_t Upper>
+    // Without WithFlags the result is the same but no flags are queued.
+    template <uint32_t Upper, bool WithFlags>
     PS2_VU_FORCE_INLINE bool fastUpper(float *value);
 #endif
 
@@ -729,7 +784,7 @@ PS2_VU_FORCE_INLINE uint32_t Frame::pairReady() const
     return ready;
 }
 
-template <uint32_t Pc, uint32_t Lower, uint32_t Upper, uint32_t Settled>
+template <uint32_t Pc, uint32_t Lower, uint32_t Upper, uint32_t Settled, bool FlagsLive>
 PS2_VU_FORCE_INLINE bool Frame::issue(uint32_t nextPc)
 {
     static constexpr Access::Decoded decoded = Access::decode(Lower, Upper);
@@ -765,7 +820,7 @@ PS2_VU_FORCE_INLINE bool Frame::issue(uint32_t nextPc)
         if constexpr (upperReadsQ(Upper))
             if (qDue())
                 commitQ();
-        upper<Upper>(upperValue);
+        upper<Upper, FlagsLive>(upperValue);
     }
 
     float lowerValue[4];
@@ -847,7 +902,7 @@ PS2_VU_FORCE_INLINE bool Frame::stale(uint32_t nextPc)
     return false;
 }
 
-template <uint32_t Upper>
+template <uint32_t Upper, bool FlagsLive>
 PS2_VU_FORCE_INLINE void Frame::upper(float *value)
 {
     if constexpr (!upperPublishesFlags(Upper))
@@ -862,7 +917,7 @@ PS2_VU_FORCE_INLINE void Frame::upper(float *value)
     else
     {
 #if PS2_VU_PROGRAM_NEON || PS2_VU_PROGRAM_SSE
-        if (fastUpper<Upper>(value))
+        if (fastUpper<Upper, FlagsLive>(value))
             return;
 #endif
         m_run.exactUpper(Upper);
@@ -1014,7 +1069,7 @@ PS2_VU_FORCE_INLINE uint32_t Frame::plainUpper(float *value)
 // computeUpper's vector cases with the same range checks, but with the flags
 // built straight into the MAC layout. Results the checks do not clear take
 // the exact path.
-template <uint32_t Upper>
+template <uint32_t Upper, bool WithFlags>
 PS2_VU_FORCE_INLINE bool Frame::fastUpper(float *value)
 {
     constexpr uint32_t code = upperCode(Upper);
@@ -1088,7 +1143,7 @@ PS2_VU_FORCE_INLINE bool Frame::fastUpper(float *value)
             if (vminvq_u32(vorrq_u32(safe, fast::inactive<dest>())) == 0u)
                 return false;
             vst1q_f32(value, result);
-            if constexpr (dest != 0u)
+            if constexpr (WithFlags && dest != 0u)
                 pushFlags(3u, fast::layout<dest>(zero, fast::negative(bits), vdupq_n_u32(0u)), 0u);
             return true;
         }
@@ -1114,7 +1169,7 @@ PS2_VU_FORCE_INLINE bool Frame::fastUpper(float *value)
             if (vminvq_u32(vorrq_u32(safe, fast::inactive<dest>())) == 0u)
                 return false;
             vst1q_f32(value, result);
-            if constexpr (dest != 0u)
+            if constexpr (WithFlags && dest != 0u)
             {
                 // The accepted exponent bound excludes product overflow. A tiny
                 // product is exact zero only when one multiplicand is zero.
@@ -1182,7 +1237,7 @@ PS2_VU_FORCE_INLINE bool Frame::fastUpper(float *value)
             if ((fast::mask(safe) & fast::kLanes<dest>) != fast::kLanes<dest>)
                 return false;
             _mm_storeu_ps(value, result);
-            if constexpr (dest != 0u)
+            if constexpr (WithFlags && dest != 0u)
                 pushFlags(3u, fast::layout<dest>(fast::mask(zero), _mm_movemask_ps(result), 0), 0u);
             return true;
         }
@@ -1208,7 +1263,7 @@ PS2_VU_FORCE_INLINE bool Frame::fastUpper(float *value)
             if ((fast::mask(safe) & fast::kLanes<dest>) != fast::kLanes<dest>)
                 return false;
             _mm_storeu_ps(value, result);
-            if constexpr (dest != 0u)
+            if constexpr (WithFlags && dest != 0u)
             {
                 const __m128i product = _mm_and_si128(_mm_castps_si128(_mm_mul_ps(left, right)), magnitudeMask);
                 const __m128i tiny = _mm_cmplt_epi32(product, _mm_set1_epi32(0x00800000));

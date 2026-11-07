@@ -426,6 +426,11 @@ public:
     std::vector<PendingTransfer> m_pendingGifTransfers;
     std::vector<PendingTransfer> m_pendingVif0Transfers;
     std::vector<PendingTransfer> m_pendingVif1Transfers;
+    // Chain buffers handed back after processing, capacity intact, so a
+    // frame's render chain neither grows a vector in steps nor frees it.
+    std::vector<std::vector<uint8_t>> m_chainBufferPool;
+    std::vector<uint8_t> takeChainBuffer();
+    void recycleChainBuffers(std::vector<PendingTransfer> &transfers);
     std::mutex m_completedDmacMutex;
     std::vector<uint32_t> m_completedDmacCauses;
 

@@ -201,6 +201,9 @@ private:
         uint64_t issueCycle = 0;
         bool active = false;
         bool currentTagEop = false;
+        // The whole packet was copied when the kick issued; the transfer only
+        // keeps time from then on. See progressXgkick.
+        bool copiedAtIssue = false;
     };
 
     static constexpr uint32_t kFmacLatency = 4u;
@@ -313,6 +316,7 @@ private:
     void advanceTo(uint64_t targetCycle);
     void flushPipelines();
     void progressXgkick();
+    bool copyXgkickPacket();
     void finishXgkick();
     uint64_t calculatePairReadyCycle(const DecodedInstructionPair &decoded) const;
     uint64_t calculatePairReadyCycleInline(const DecodedInstructionPair &decoded) const;

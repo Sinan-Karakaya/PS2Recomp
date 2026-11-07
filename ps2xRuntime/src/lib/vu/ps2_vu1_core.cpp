@@ -1,6 +1,7 @@
 #include "ps2_vu1_exec.inl"
 #include "ps2_vu1_program.h"
 #include "runtime/ps2_vu1.h"
+#include "runtime/ps2_vu1_options.h"
 #include "runtime/gs/ps2_gif_arbiter.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ps2_memory.h"
@@ -107,12 +108,61 @@ void VU1Interpreter::reset()
         ps2_vu_program::forgetRoutines();
 }
 
+namespace
+{
+    // By default the kicked packet is read a qword every two cycles, as the
+    // hardware reads it, so a program that rewrites a buffer while it is
+    // still being sent gets the mix the hardware would. A game can instead
+    // have the packet copied when the kick issues and only its timing kept
+    // (ps2_vu1_options.h): the same cycle count, one memcpy instead of
+    // thousands of 16-byte ones, and no GIF tag parsed twice.
+    // PS2X_XGKICK_VERIFY=1 compares the source against the copy when the
+    // transfer would have ended, and counts the kicks a program changed
+    // meanwhile, which is what the per-qword path is for.
+    const bool g_xgkickSync = [] {
+        const char *value = std::getenv("PS2X_XGKICK_SYNC");
+        return value && *value && std::strcmp(value, "0") != 0;
+    }();
+    bool g_xgkickCopyAtIssue = false;
+    const bool g_xgkickVerify = [] {
+        const char *value = std::getenv("PS2X_XGKICK_VERIFY");
+        return value && *value && std::strcmp(value, "0") != 0;
+    }();
+    uint64_t g_xgkickVerified = 0u, g_xgkickChanged = 0u;
+}
+
 void VU1Interpreter::progressXgkick()
 {
     if (!m_xgkick.active || !m_activeVuData || m_activeVuDataSize == 0u)
         return;
 
     ++m_xgkick.cycleCredit;
+    if (m_xgkick.copiedAtIssue)
+    {
+        // Two cycles a qword, as below; the bytes are already here.
+        const uint32_t qwords = m_xgkick.cycleCredit / 2u;
+        m_xgkick.cycleCredit -= qwords * 2u;
+        m_xgkick.copiedBytes += qwords * 16u;
+        if (m_xgkick.copiedBytes >= m_xgkick.totalBytes)
+        {
+            if (g_xgkickVerify)
+            {
+                ++g_xgkickVerified;
+                bool same = true;
+                for (uint32_t offset = 0u; offset < m_xgkick.totalBytes && same; offset += 16u)
+                {
+                    const uint32_t source = (m_xgkick.sourceAddress + offset) % m_activeVuDataSize;
+                    same = std::memcmp(m_xgkick.packet.data() + offset, m_activeVuData + source, 16u) == 0;
+                }
+                if (!same && (++g_xgkickChanged <= 8u || (g_xgkickChanged & (g_xgkickChanged - 1u)) == 0u))
+                    std::fprintf(stderr, "[vu1] xgkick: packet at 0x%x changed during its transfer (%llu of %llu kicks)\n",
+                                 m_xgkick.sourceAddress, static_cast<unsigned long long>(g_xgkickChanged),
+                                 static_cast<unsigned long long>(g_xgkickVerified));
+            }
+            finishXgkick();
+        }
+        return;
+    }
     while (m_xgkick.active && m_xgkick.cycleCredit >= 2u)
     {
         m_xgkick.cycleCredit -= 2u;
@@ -210,6 +260,61 @@ void VU1Interpreter::startXgkick(uint32_t qwordAddress)
     m_xgkick.sourceAddress = sourceAddress;
     m_xgkick.cycleCredit = 1u; // XGKICK's issue cycle counts toward PATH1.
     m_xgkick.issueCycle = m_cycle;
+    m_xgkick.copiedAtIssue = g_xgkickCopyAtIssue && copyXgkickPacket();
+}
+
+void ps2Vu1SetXgkickCopyAtIssue(bool enabled) { g_xgkickCopyAtIssue = enabled && !g_xgkickSync; }
+bool ps2Vu1XgkickCopyAtIssue() { return g_xgkickCopyAtIssue; }
+
+// Walks the GIF tags from the kicked address to size the packet and copies it
+// whole. Anything the per-qword path would report (a reserved format, a
+// packet past the buffer) is left to that path, which runs instead.
+bool VU1Interpreter::copyXgkickPacket()
+{
+    uint32_t total = 0u;
+    while (true)
+    {
+        if (total > XgkickPipeline::kBufferSize - 16u)
+            return false;
+        const uint32_t source = (m_xgkick.sourceAddress + total) % m_activeVuDataSize;
+        uint64_t tagLo = 0;
+        if (m_activeVuDataSize - source >= 8u)
+            std::memcpy(&tagLo, m_activeVuData + source, sizeof(tagLo));
+        else
+        {
+            uint8_t bytes[8];
+            for (uint32_t i = 0u; i < 8u; ++i)
+                bytes[i] = m_activeVuData[(source + i) % m_activeVuDataSize];
+            std::memcpy(&tagLo, bytes, sizeof(tagLo));
+        }
+        const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
+        const uint32_t format = static_cast<uint32_t>((tagLo >> 58) & 0x3u);
+        uint32_t nreg = static_cast<uint32_t>((tagLo >> 60) & 0xFu);
+        if (nreg == 0u)
+            nreg = 16u;
+        uint64_t tagBytes = 16u;
+        if (format == 0u)
+            tagBytes += static_cast<uint64_t>(nloop) * nreg * 16u;
+        else if (format == 1u)
+            tagBytes += ((static_cast<uint64_t>(nloop) * nreg + 1u) & ~1ull) * 8u;
+        else if (format == 2u)
+            tagBytes += static_cast<uint64_t>(nloop) * 16u;
+        else
+            return false;
+        if (tagBytes > XgkickPipeline::kBufferSize - total)
+            return false;
+        total += static_cast<uint32_t>(tagBytes);
+        if (((tagLo >> 15) & 1u) != 0u)
+            break;
+    }
+    const uint32_t first = std::min(total, m_activeVuDataSize - m_xgkick.sourceAddress);
+    std::memcpy(m_xgkick.packet.data(), m_activeVuData + m_xgkick.sourceAddress, first);
+    if (first < total)
+        std::memcpy(m_xgkick.packet.data() + first, m_activeVuData, total - first);
+    m_xgkick.totalBytes = total;
+    m_xgkick.currentTagEnd = total;
+    m_xgkick.currentTagEop = true;
+    return true;
 }
 
 bool VU1Interpreter::pipelinesPending() const

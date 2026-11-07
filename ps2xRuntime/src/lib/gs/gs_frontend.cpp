@@ -767,6 +767,38 @@ std::atomic<bool> g_gsFrontendTiming{false};
 std::atomic<uint64_t> g_gsUploadNativeNanos{0};
 std::atomic<uint64_t> g_gsUploadNativeCount{0};
 
+namespace
+{
+    // Primitives of one packet, handed to the backend together: the threaded
+    // backend pays a lock per call, and DQ8 draws over a million primitives a
+    // second. Flushed before any other backend call so their order holds, and
+    // at the end of every packet. The frontend is one instance driven under
+    // its state lock, so one buffer serves it.
+    std::vector<GSPrimitiveBatch> g_primitiveRun;
+    std::vector<const GSPrimitiveBatch *> g_primitiveRunPointers;
+    // Taken while a run is being submitted: a backend that reads or writes
+    // local memory through the frontend on the way would otherwise flush the
+    // same run again, without end.
+    bool g_primitiveRunFlushing = false;
+
+    void flushPrimitiveRun(GSRasterBackend *backend)
+    {
+        if (g_primitiveRun.empty() || g_primitiveRunFlushing)
+            return;
+        if (backend)
+        {
+            g_primitiveRunFlushing = true;
+            g_primitiveRunPointers.clear();
+            g_primitiveRunPointers.reserve(g_primitiveRun.size());
+            for (const GSPrimitiveBatch &batch : g_primitiveRun)
+                g_primitiveRunPointers.push_back(&batch);
+            backend->SubmitMany(g_primitiveRunPointers.data(), g_primitiveRunPointers.size());
+            g_primitiveRunFlushing = false;
+        }
+        g_primitiveRun.clear();
+    }
+}
+
 void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
     struct PacketTimer
@@ -790,6 +822,12 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (!data || sizeBytes < 16 || !m_backend)
         return;
+    // Whatever this packet draws goes to the backend before it returns.
+    struct RunFlush
+    {
+        GSRasterBackend *backend;
+        ~RunFlush() { flushPrimitiveRun(backend); }
+    } runFlush{m_backend.get()};
 
     if (tryProcessNativeImageUploadPacket(data, sizeBytes))
         return;
@@ -1545,6 +1583,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
             command.trxpos = m_trxpos;
             command.trxreg = m_trxreg;
             command.direction = m_trxdir;
+            flushPrimitiveRun(m_backend.get());
             m_backend->BeginTransfer(command);
         }
         recordTransferDebugEventUnlocked();
@@ -1567,7 +1606,10 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         break;
     case GS_REG_TEXFLUSH:
         if (m_backend)
+        {
+            flushPrimitiveRun(m_backend.get());
             m_backend->TextureFlush();
+        }
         break;
     case GS_REG_SCANMSK:
         m_scanmsk = value;
@@ -1632,6 +1674,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     {
         if (m_backend)
         {
+            flushPrimitiveRun(m_backend.get());
             m_backend->Flush();
             m_backend->Sync(GSSyncReason::Finish);
         }
@@ -1728,9 +1771,9 @@ void GS::vertexKick(bool drawing)
 
     if (drawing && m_backend)
     {
-        GSPrimitiveBatch batch = buildDrawBatch(needed);
+        GSPrimitiveBatch &batch = g_primitiveRun.emplace_back();
+        fillDrawBatch(batch, needed);
         updatePreferredDisplaySourceForDraw(batch);
-        m_backend->Submit(batch);
         recordDrawDebugEventUnlocked(needed);
     }
 
@@ -1764,25 +1807,31 @@ void GS::vertexKick(bool drawing)
 void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
 {
     if (m_backend)
+    {
+        flushPrimitiveRun(m_backend.get());
         m_backend->UploadImage(data, sizeBytes);
+    }
 }
 
 
 bool GS::clearFramebufferContext(uint32_t contextIndex, uint32_t rgba)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    flushPrimitiveRun(m_backend.get());
     return m_backend && m_backend->ClearFramebuffer(m_ctx[(contextIndex != 0u) ? 1 : 0], rgba);
 }
 
 bool GS::clearActiveFramebuffer(uint32_t rgba)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    flushPrimitiveRun(m_backend.get());
     return m_backend && m_backend->ClearFramebuffer(activeContext(), rgba);
 }
 
 uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    flushPrimitiveRun(m_backend.get());
     return m_backend ? m_backend->ConsumeLocalToHostBytes(dst, maxBytes) : 0u;
 }
 
@@ -1818,6 +1867,7 @@ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
 uint32_t GS::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    flushPrimitiveRun(m_backend.get());
     return m_backend ? m_backend->ReadVram(psm, base, bw, x, y) : 0u;
 }
 
@@ -1825,12 +1875,21 @@ void GS::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (m_backend)
+    {
+        flushPrimitiveRun(m_backend.get());
         m_backend->WriteVram(psm, base, bw, x, y, value);
+    }
 }
 
 GSPrimitiveBatch GS::buildDrawBatch(int vertexCount) const
 {
     GSPrimitiveBatch batch{};
+    fillDrawBatch(batch, vertexCount);
+    return batch;
+}
+
+void GS::fillDrawBatch(GSPrimitiveBatch &batch, int vertexCount) const
+{
     batch.vertexCount = static_cast<uint8_t>(std::min(vertexCount, 3));
     for (int i = 0; i < batch.vertexCount; ++i)
         batch.vertices[static_cast<size_t>(i)] = m_vtxQueue[i];
@@ -1852,7 +1911,6 @@ GSPrimitiveBatch GS::buildDrawBatch(int vertexCount) const
     const uint8_t mmag = static_cast<uint8_t>((tex1 >> 5u) & 0x1u);
     const uint8_t mmin = static_cast<uint8_t>((tex1 >> 6u) & 0x7u);
     batch.state.linearFilter = mmag != 0u || mmin == 1u || (mmin & 0x4u) != 0u;
-    return batch;
 }
 
 void GS::updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch)
